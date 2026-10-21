@@ -13,7 +13,7 @@ use syn::visit::{self, Visit};
 use crate::context::AnalysisContext;
 use crate::finding::SourceLocation;
 use crate::soroban::{self, ContractAttrStrength};
-use crate::source::{attribute_path, ParsedSource};
+use crate::source::{attribute_path, ImportMap, ParsedSource};
 
 /// Method names that mutate Soroban storage.
 pub const STORAGE_MUTATORS: &[&str] = &["set", "remove", "update", "extend_ttl", "set_ttl", "bump"];
@@ -196,6 +196,14 @@ impl Facts {
         self.function_calls
             .iter()
             .filter(|c| c.name == "new" && c.context.contains("Client"))
+            .collect()
+    }
+
+    /// Cross-contract constructors after resolving local `use` aliases.
+    pub fn cross_contract_constructors_with(&self, imports: &ImportMap) -> Vec<&CallFact> {
+        self.function_calls
+            .iter()
+            .filter(|c| c.name == "new" && imports.may_resolve_to(&c.context, "Client"))
             .collect()
     }
 

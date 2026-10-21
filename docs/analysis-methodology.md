@@ -197,6 +197,20 @@ The scanner provides explicit mechanisms for reviewed exceptions:
 None of these mechanisms changes the underlying evidence. They record a policy
 decision; they do not make the code safe.
 
+## Import resolution
+
+The parser records a per-file map of `use` aliases and globs and exposes
+`ParsedSource::resolve_path`. Resolution is **syntactic and best-effort**:
+
+- `use crate::token::Client as C;` lets a detector recognize `C::new(...)` as a
+  cross-contract client constructor.
+- A bare name covered by a glob (`use crate::token::*;`) cannot be resolved
+  without name resolution, so it is reported as ambiguous rather than guessed.
+- Paths with an explicit qualifier are preserved as written.
+- No cross-crate or type-aware resolution is attempted. When a path is
+  ambiguous, security-sensitive detectors may conservatively report rather
+  than suppress the finding; the rule's documented confidence still applies.
+
 ## Responsible use
 
 - Treat findings as leads, not verdicts. Confirm the data flow, reachability,

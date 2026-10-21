@@ -335,6 +335,153 @@ pub struct ConstSummary {
     pub attributes: Vec<String>,
 }
 
+/// Result of a best-effort syntactic import resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolution {
+    /// One canonical path was found.
+    Resolved(String),
+    /// Multiple candidates match the local name.
+    Ambiguous(Vec<String>),
+    /// No import mapping applies; the path is already qualified or unknown.
+    Unresolved,
+}
+
+/// Per-file `use` map for best-effort path canonicalization.
+///
+/// Only syntax is inspected: aliases are recorded as written, globs are
+/// recorded by module prefix, and no cross-crate name resolution is attempted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportMap {
+    aliases: BTreeMap<String, Vec<String>>,
+    globs: Vec<String>,
+}
+
+impl ImportMap {
+    /// Builds an import map from every `use` item in a parsed file.
+    pub fn from_file(file: &syn::File) -> Self {
+        let mut map = ImportMap::default();
+        map.collect_items(&file.items);
+        map.globs.sort();
+        map.globs.dedup();
+        for candidates in map.aliases.values_mut() {
+            candidates.sort();
+            candidates.dedup();
+        }
+        map
+    }
+
+    fn collect_items(&mut self, items: &[syn::Item]) {
+        for item in items {
+            match item {
+                syn::Item::Use(item) => self.collect_tree(&item.tree, ""),
+                syn::Item::Mod(module) => {
+                    if let Some((_, sub_items)) = &module.content {
+                        self.collect_items(sub_items);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn collect_tree(&mut self, tree: &syn::UseTree, prefix: &str) {
+        use syn::UseTree;
+        match tree {
+            UseTree::Path(path) => {
+                let next = join_path(prefix, &path.ident.to_string());
+                self.collect_tree(&path.tree, &next);
+            }
+            UseTree::Name(name) => {
+                self.add_alias(
+                    &name.ident.to_string(),
+                    &join_path(prefix, &name.ident.to_string()),
+                );
+            }
+            UseTree::Rename(rename) => {
+                self.add_alias(
+                    &rename.rename.to_string(),
+                    &join_path(prefix, &rename.ident.to_string()),
+                );
+            }
+            UseTree::Glob(_) => self.globs.push(format!("{prefix}::*")),
+            UseTree::Group(group) => {
+                for item in &group.items {
+                    self.collect_tree(item, prefix);
+                }
+            }
+        }
+    }
+
+    fn add_alias(&mut self, local: &str, canonical: &str) {
+        let entry = self.aliases.entry(local.to_string()).or_default();
+        if !entry.iter().any(|candidate| candidate == canonical) {
+            entry.push(canonical.to_string());
+        }
+    }
+
+    /// Resolves the first path segment through an alias.
+    ///
+    /// `C::new` with `use crate::token::Client as C` resolves to
+    /// `crate::token::Client::new`. A bare name with any glob import is
+    /// reported as ambiguous rather than guessed.
+    pub fn resolve(&self, path: &str) -> Resolution {
+        let compact: String = path
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        let trimmed = compact.trim_start_matches("::");
+        let (head, rest) = match trimmed.split_once("::") {
+            Some((head, rest)) => (head, Some(rest)),
+            None => (trimmed, None),
+        };
+        if let Some(candidates) = self.aliases.get(head) {
+            let resolved: Vec<String> = candidates
+                .iter()
+                .map(|candidate| match rest {
+                    Some(rest) => format!("{candidate}::{rest}"),
+                    None => candidate.clone(),
+                })
+                .collect();
+            if resolved.len() == 1 {
+                return Resolution::Resolved(resolved[0].clone());
+            }
+            return Resolution::Ambiguous(resolved);
+        }
+        if rest.is_none() && !self.globs.is_empty() {
+            return Resolution::Ambiguous(self.globs.clone());
+        }
+        if rest.is_some() {
+            Resolution::Resolved(trimmed.to_string())
+        } else {
+            Resolution::Unresolved
+        }
+    }
+
+    /// Returns true when a path may resolve to a canonical path containing
+    /// `needle`. Ambiguity is treated as a possible match so detection fails
+    /// toward reporting rather than suppressing a finding.
+    pub fn may_resolve_to(&self, path: &str, needle: &str) -> bool {
+        match self.resolve(path) {
+            Resolution::Resolved(canonical) => canonical.contains(needle),
+            Resolution::Ambiguous(candidates) => {
+                candidates
+                    .iter()
+                    .any(|candidate| candidate.contains(needle))
+                    || !self.globs.is_empty()
+            }
+            Resolution::Unresolved => path.contains(needle),
+        }
+    }
+}
+
+fn join_path(prefix: &str, segment: &str) -> String {
+    if prefix.is_empty() {
+        segment.to_string()
+    } else {
+        format!("{prefix}::{segment}")
+    }
+}
+
 /// A parsed Rust source file.
 pub struct ParsedSource {
     /// File path.
@@ -363,6 +510,8 @@ pub struct ParsedSource {
     pub contract_definitions: Vec<String>,
     /// Inline suppression directives detected in the file.
     pub suppressions: Vec<crate::suppression::Suppression>,
+    /// Best-effort `use` alias/glob map for this file.
+    pub imports: ImportMap,
 }
 
 impl ParsedSource {
@@ -379,6 +528,11 @@ impl ParsedSource {
     /// Returns functions that are Soroban contract entry points.
     pub fn contract_entry_points(&self) -> impl Iterator<Item = &FunctionSummary> {
         self.functions.iter().filter(|f| f.is_contract_entry_point)
+    }
+
+    /// Best-effort syntactic resolution of a path written in this file.
+    pub fn resolve_path(&self, path: &str) -> Resolution {
+        self.imports.resolve(path)
     }
 }
 
@@ -1521,6 +1675,7 @@ pub fn parse_source_with_options(
             contract_types: Vec::new(),
             contract_definitions: Vec::new(),
             suppressions: Vec::new(),
+            imports: ImportMap::default(),
         };
     }
 
@@ -1547,6 +1702,7 @@ pub fn parse_source_with_options(
             );
             let (macro_definitions, macro_invocations) = macro_inventory(&file);
             let suppressions = crate::suppression::detect(content, path, &item_spans(&file));
+            let imports = ImportMap::from_file(&file);
             ParsedSource {
                 path: path.to_path_buf(),
                 module_path,
@@ -1561,6 +1717,7 @@ pub fn parse_source_with_options(
                 contract_types,
                 contract_definitions,
                 suppressions,
+                imports,
             }
         }
         Err(err) => ParsedSource {
@@ -1577,6 +1734,7 @@ pub fn parse_source_with_options(
             contract_types: Vec::new(),
             contract_definitions: Vec::new(),
             suppressions: Vec::new(),
+            imports: ImportMap::default(),
         },
     }
 }
@@ -2318,6 +2476,30 @@ mod tests {
         assert!(diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == DiagnosticCode::SourceModulePathRejected));
+    }
+
+    #[test]
+    fn resolves_use_aliases_and_reports_glob_ambiguity() {
+        let s = parse(
+            r#"
+            use soroban_sdk::{Address as Addr, token::Client as C};
+            use crate::token::*;
+            "#,
+        );
+
+        assert_eq!(
+            s.resolve_path("Addr::new"),
+            Resolution::Resolved("soroban_sdk::Address::new".to_string())
+        );
+        assert_eq!(
+            s.resolve_path("C::new"),
+            Resolution::Resolved("soroban_sdk::token::Client::new".to_string())
+        );
+        assert!(matches!(
+            s.resolve_path("Unknown"),
+            Resolution::Ambiguous(_)
+        ));
+        assert!(s.imports.may_resolve_to("C::new", "Client"));
     }
 
     #[test]

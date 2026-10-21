@@ -57,7 +57,7 @@ impl Rule for CrossContractAuth {
                 if facts.has_require_auth() {
                     continue;
                 }
-                for call in facts.cross_contract_constructors() {
+                for call in facts.cross_contract_constructors_with(&source.imports) {
                     if has_trusted_client_address(&facts, call) {
                         continue;
                     }
